@@ -1,303 +1,683 @@
+import os
+import random
+import warnings
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib as mpl
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import numpy as np
-import pandas as pd
+
 from torch.utils.data import Dataset, DataLoader
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-import matplotlib.pyplot as plt
-import matplotlib as mpl
-import warnings
-import random
-import os
 
-# ------------------- Global Settings -------------------
-warnings.filterwarnings('ignore')
 
-# [Control Switch]
-# True: Skip training, load .pth directly for plotting
-# False: Retrain model
-ONLY_PLOT = True
+warnings.filterwarnings("ignore")
+
+ONLY_PLOT = False
+SEED = 42
 
 
 def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
     torch.manual_seed(seed)
+
     if torch.cuda.is_available():
         torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
-    np.random.seed(seed)
-    random.seed(seed)
+
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
 
-set_seed(42)
+set_seed(SEED)
 
 
-# ------------------- Core Modules (MLSTM-ICA Components) -------------------
-
-class GRN(nn.Module):
-    """Gated Residual Network"""
-
-    def __init__(self, input_dim, hidden_dim=None, dropout=0.1):
+class MogrifierLSTMCell(nn.Module):
+    def __init__(self, input_dim, hidden_dim, mogrify_steps=3):
         super().__init__()
-        hidden_dim = hidden_dim or input_dim
-        self.W2 = nn.Linear(input_dim, hidden_dim)
-        self.W3 = nn.Linear(input_dim, hidden_dim)
-        self.b2 = nn.Parameter(torch.zeros(hidden_dim))
-        self.W1 = nn.Linear(hidden_dim, input_dim)
-        self.b1 = nn.Parameter(torch.zeros(input_dim))
-        self.glu = nn.Linear(input_dim, input_dim * 2)
-        self.layer_norm = nn.LayerNorm(input_dim)
-        self.dropout = nn.Dropout(dropout)
 
-    def forward(self, a, c=None):
-        val = self.W2(a) + self.b2
-        if c is not None:
-            val = val + self.W3(c)
-        eta2 = torch.nn.functional.elu(val)
-        eta1 = self.W1(eta2) + self.b1
-        gates = self.glu(eta1)
-        gate, skip = gates.chunk(2, dim=-1)
-        gated_output = torch.sigmoid(gate) * skip
-        return self.layer_norm(a + self.dropout(gated_output))
-
-
-class ConvAttention(nn.Module):
-    """Convolutional Attention (Intra-variable correlation)"""
-
-    def __init__(self, hidden_dim, kernel_size=3):
-        super().__init__()
-        self.conv = nn.Conv1d(hidden_dim, hidden_dim, kernel_size=kernel_size, padding=kernel_size // 2)
-        self.attn = nn.Linear(hidden_dim, hidden_dim)
-
-    def forward(self, x):
-        # x shape: [batch, seq_len, hidden]
-        conv_out = self.conv(x.transpose(1, 2)).transpose(1, 2)
-        attn_weights = torch.softmax(self.attn(conv_out), dim=-1)
-        weighted = torch.sum(attn_weights * x, dim=1)
-        return weighted
-
-
-class CrossAttention(nn.Module):
-    """Cross Attention (Inter-stage correlation)"""
-
-    def __init__(self, hidden_dim, num_heads=4):
-        super().__init__()
-        assert hidden_dim % num_heads == 0, "hidden_dim must be divisible by num_heads"
+        self.input_dim = input_dim
         self.hidden_dim = hidden_dim
-        self.num_heads = num_heads
-        self.head_dim = hidden_dim // num_heads
+        self.mogrify_steps = mogrify_steps
 
-        self.q_linear = nn.Linear(hidden_dim, hidden_dim)
-        self.k_linear = nn.Linear(hidden_dim, hidden_dim)
-        self.v_linear = nn.Linear(hidden_dim, hidden_dim)
-        self.out_linear = nn.Linear(hidden_dim, hidden_dim)
+        self.q_layers = nn.ModuleDict()
+        self.r_layers = nn.ModuleDict()
 
-    def forward(self, query, key, value):
-        batch_size = query.size(0)
-        q = self.q_linear(query).view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
-        k = self.k_linear(key).view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
-        v = self.v_linear(value).view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
+        for i in range(1, mogrify_steps + 1):
+            if i % 2 == 1:
+                self.q_layers[str(i)] = nn.Linear(
+                    hidden_dim,
+                    input_dim,
+                    bias=True
+                )
+            else:
+                self.r_layers[str(i)] = nn.Linear(
+                    input_dim,
+                    hidden_dim,
+                    bias=True
+                )
 
-        scores = torch.matmul(q, k.transpose(-2, -1)) / torch.sqrt(
-            torch.tensor(self.head_dim, dtype=torch.float32).to(query.device))
+        self.lstm_cell = nn.LSTMCell(
+            input_size=input_dim,
+            hidden_size=hidden_dim
+        )
 
-        attn_weights = torch.softmax(scores, dim=-1)
-        attended = torch.matmul(attn_weights, v)
-        attended = attended.transpose(1, 2).contiguous().view(batch_size, -1, self.hidden_dim)
-        return self.out_linear(attended)
+    def forward(self, x_t, h_prev, c_prev):
+        x_m = x_t
+        h_m = h_prev
+
+        for i in range(1, self.mogrify_steps + 1):
+            if i % 2 == 1:
+                gate_x = 2.0 * torch.sigmoid(
+                    self.q_layers[str(i)](h_m)
+                )
+                x_m = gate_x * x_m
+            else:
+                gate_h = 2.0 * torch.sigmoid(
+                    self.r_layers[str(i)](x_m)
+                )
+                h_m = gate_h * h_m
+
+        h_new, c_new = self.lstm_cell(
+            x_m,
+            (h_m, c_prev)
+        )
+
+        return h_new, c_new
 
 
-class WeightedFusion(nn.Module):
-    """Adaptive Fusion Layer"""
-
-    def __init__(self, hidden_dim):
+class MogrifierLSTM(nn.Module):
+    def __init__(
+        self,
+        input_dim,
+        hidden_dim,
+        num_layers=2,
+        mogrify_steps=3,
+        dropout=0.0
+    ):
         super().__init__()
-        self.fuse = nn.Linear(hidden_dim * 2, hidden_dim)
-        self.gate = nn.Linear(hidden_dim * 2, hidden_dim)
 
-    def forward(self, dec_out, enc_out):
-        combined = torch.cat([dec_out, enc_out], dim=-1)
-        gate = torch.sigmoid(self.gate(combined))
-        fused = torch.tanh(self.fuse(combined))
-        return gate * fused + (1 - gate) * enc_out
-
-
-class SafeMogrifierLSTM(nn.Module):
-    """LSTM improved with Mogrifier interactions"""
-
-    def __init__(self, input_dim, hidden_dim, num_layers=1, mogrify_steps=3):
-        super().__init__()
+        self.input_dim = input_dim
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
         self.mogrify_steps = mogrify_steps
-        self.mogrifier = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(hidden_dim + input_dim, 64),
-                nn.Tanh(),
-                nn.Linear(64, hidden_dim + input_dim)
-            ) for _ in range(mogrify_steps)
-        ])
-        self.lstm = nn.LSTM(
-            input_size=input_dim,
-            hidden_size=hidden_dim,
-            num_layers=num_layers,
-            batch_first=True
-        )
+        self.dropout_rate = dropout
+
+        self.cells = nn.ModuleList()
+
+        for layer_idx in range(num_layers):
+            current_input_dim = (
+                input_dim
+                if layer_idx == 0
+                else hidden_dim
+            )
+
+            self.cells.append(
+                MogrifierLSTMCell(
+                    input_dim=current_input_dim,
+                    hidden_dim=hidden_dim,
+                    mogrify_steps=mogrify_steps
+                )
+            )
+
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x, hidden=None):
-        batch_size, seq_len, _ = x.size()
+        batch_size, seq_len, _ = x.shape
+        device = x.device
+
         if hidden is None:
-            h = torch.zeros(self.num_layers, batch_size, self.hidden_dim, device=x.device)
-            c = torch.zeros(self.num_layers, batch_size, self.hidden_dim, device=x.device)
+            h_states = [
+                torch.zeros(
+                    batch_size,
+                    self.hidden_dim,
+                    device=device
+                )
+                for _ in range(self.num_layers)
+            ]
+
+            c_states = [
+                torch.zeros(
+                    batch_size,
+                    self.hidden_dim,
+                    device=device
+                )
+                for _ in range(self.num_layers)
+            ]
         else:
-            h, c = hidden
+            h_init, c_init = hidden
 
-        h_lstm = h.clone()
-        c_lstm = c.clone()
-        x_original = x.clone()
+            h_states = [
+                h_init[i]
+                for i in range(self.num_layers)
+            ]
 
-        # Mogrification steps
-        for i in range(self.mogrify_steps):
-            h_last = h_lstm[-1].unsqueeze(1)
-            h_expanded = h_last.expand(-1, seq_len, -1)
-            combined = torch.cat([x, h_expanded], dim=-1)
-            gate = self.mogrifier[i](combined)
-            x_gate, h_gate = torch.split(gate, [x.size(-1), self.hidden_dim], dim=-1)
-            x = x_original * torch.sigmoid(x_gate)
-            new_h_last = h_last * torch.sigmoid(h_gate[:, -1:, :])
-            if self.num_layers > 1:
-                h_lstm = torch.cat([h_lstm[:-1], new_h_last.squeeze(1).unsqueeze(0)], dim=0)
-            else:
-                h_lstm = new_h_last.squeeze(1).unsqueeze(0)
+            c_states = [
+                c_init[i]
+                for i in range(self.num_layers)
+            ]
 
-        out, (h, c) = self.lstm(x, (h_lstm.contiguous(), c_lstm.contiguous()))
-        return out, (h, c)
+        outputs = []
+
+        for t in range(seq_len):
+            layer_input = x[:, t, :]
+
+            for layer_idx, cell in enumerate(self.cells):
+                h_new, c_new = cell(
+                    layer_input,
+                    h_states[layer_idx],
+                    c_states[layer_idx]
+                )
+
+                h_states[layer_idx] = h_new
+                c_states[layer_idx] = c_new
+                layer_input = h_new
+
+                if (
+                    self.dropout_rate > 0
+                    and layer_idx < self.num_layers - 1
+                ):
+                    layer_input = self.dropout(layer_input)
+
+            outputs.append(layer_input.unsqueeze(1))
+
+        output = torch.cat(outputs, dim=1)
+        h_n = torch.stack(h_states, dim=0)
+        c_n = torch.stack(c_states, dim=0)
+
+        return output, (h_n, c_n)
 
 
-# ------------------- Main Model: MLSTM-ICA -------------------
-
-class MLSTM_ICA(nn.Module):
-    def __init__(self, encoder_dim, decoder_dim, hidden_dim, target_dim, pred_steps,
-                 num_layers=2, mogrify_steps=3, num_heads=4):
+class GRN(nn.Module):
+    def __init__(
+        self,
+        input_dim,
+        hidden_dim=None,
+        dropout=0.1
+    ):
         super().__init__()
-        self.pred_steps = pred_steps
-        self.target_dim = target_dim
-        self.hidden_dim = hidden_dim
 
-        # 1. Encoder & Decoder (Mogrifier Enhanced)
-        self.encoder = SafeMogrifierLSTM(encoder_dim, hidden_dim, num_layers, mogrify_steps)
-        self.decoder = SafeMogrifierLSTM(decoder_dim, hidden_dim, num_layers, mogrify_steps)
-
-        # 2. Gated Residual Network (GRN)
-        self.grn = GRN(hidden_dim, hidden_dim * 2)
-
-        # 3. Attention Mechanisms
-        self.conv_attn_encoder = ConvAttention(hidden_dim)
-        self.cross_attn = CrossAttention(hidden_dim, num_heads=num_heads)
-
-        # 4. Fusion Layer
-        self.weighted_fusion = WeightedFusion(hidden_dim)
-
-        # 5. Output Head
-        self.head = nn.Linear(hidden_dim, target_dim * pred_steps)
-
-    def forward(self, x_enc, x_dec):
-        batch_size = x_enc.size(0)
-
-        # 1. Temporal Processing
-        enc_out, (h_enc, _) = self.encoder(x_enc)
-        dec_out, (h_dec, _) = self.decoder(x_dec)
-
-        # 2. Decoder Enhancement Path (GRN)
-        dec_mean = dec_out.mean(dim=1)
-        enc_mean = enc_out.mean(dim=1)
-        dec_feat = self.grn(a=dec_mean, c=enc_mean)
-
-        # 3. Encoder Feature Extraction Path (Attentions)
-        # 3a. Intra-series correlation (Conv Attn)
-        conv_feat = self.conv_attn_encoder(enc_out)
-
-        # 3b. Inter-series correlation (Cross Attn)
-        last_h_dec = h_dec[-1].unsqueeze(1)
-        cross_feat = self.cross_attn(query=last_h_dec, key=enc_out, value=enc_out).squeeze(1)
-
-        # Combine Attentions
-        attn_output = conv_feat + cross_feat
-
-        # Dimension alignment
-        if dec_feat.dim() > 2: dec_feat = dec_feat.view(batch_size, -1)
-        if attn_output.dim() > 2: attn_output = attn_output.view(batch_size, -1)
-
-        # 4. Final Adaptive Fusion
-        final_feat = self.weighted_fusion(dec_feat, attn_output)
-
-        output = self.head(final_feat)
-        return output.view(-1, self.pred_steps, self.target_dim)
-
-
-# ------------------- Data Processing -------------------
-
-class SafeSeparatedInputProcessor:
-    def __init__(self, encoder_features, decoder_features, target_cols, window_size=15, pred_steps=1):
-        self.encoder_features = encoder_features
-        self.decoder_features = decoder_features
-        self.target_cols = target_cols
-        self.window_size = window_size
-        self.pred_steps = pred_steps
-        self.encoder_scaler = MinMaxScaler()
-        self.decoder_scaler = MinMaxScaler()
-        self.target_scalers = {col: MinMaxScaler() for col in target_cols}
-        self._fitted = False
-
-    def load_data(self, csv_path, fit_scalers=False):
-        raw_data = pd.read_csv(csv_path)
-        encoder_data = raw_data[self.encoder_features].values
-        decoder_data = raw_data[self.decoder_features].values
-        target_data = raw_data[self.target_cols].values
-
-        if fit_scalers or not self._fitted:
-            scaled_encoder = self.encoder_scaler.fit_transform(encoder_data)
-            scaled_decoder = self.decoder_scaler.fit_transform(decoder_data)
-            scaled_target = np.hstack([
-                self.target_scalers[col].fit_transform(target_data[:, i].reshape(-1, 1))
-                for i, col in enumerate(self.target_cols)
-            ])
-            self._fitted = True
-        else:
-            scaled_encoder = self.encoder_scaler.transform(encoder_data)
-            scaled_decoder = self.decoder_scaler.transform(decoder_data)
-            scaled_target = np.hstack([
-                self.target_scalers[col].transform(target_data[:, i].reshape(-1, 1))
-                for i, col in enumerate(self.target_cols)
-            ])
-
-        X_enc, X_dec, y = [], [], []
-        max_index = len(scaled_encoder) - self.window_size - self.pred_steps + 1
-        for i in range(max_index):
-            X_enc.append(scaled_encoder[i:i + self.window_size])
-            X_dec.append(scaled_decoder[i:i + self.window_size])
-            y.append(scaled_target[i + self.window_size:i + self.window_size + self.pred_steps])
-
-        return (
-            torch.FloatTensor(np.array(X_enc)),
-            torch.FloatTensor(np.array(X_dec)),
-            torch.FloatTensor(np.array(y))
+        hidden_dim = (
+            hidden_dim
+            if hidden_dim is not None
+            else input_dim
         )
 
-    def inverse_transform_targets(self, scaled_data):
-        results = []
-        for i, col in enumerate(self.target_cols):
-            results.append(
-                self.target_scalers[col].inverse_transform(scaled_data[:, i].reshape(-1, 1))
+        self.fc_a = nn.Linear(
+            input_dim,
+            hidden_dim
+        )
+
+        self.fc_c = nn.Linear(
+            input_dim,
+            hidden_dim
+        )
+
+        self.fc_out = nn.Linear(
+            hidden_dim,
+            input_dim
+        )
+
+        self.gate_fc = nn.Linear(
+            input_dim,
+            input_dim
+        )
+
+        self.value_fc = nn.Linear(
+            input_dim,
+            input_dim
+        )
+
+        self.dropout = nn.Dropout(dropout)
+
+        self.layer_norm = nn.LayerNorm(
+            input_dim
+        )
+
+        self.elu = nn.ELU()
+
+    def forward(self, a, c=None):
+        eta2 = self.fc_a(a)
+
+        if c is not None:
+            eta2 = eta2 + self.fc_c(c)
+
+        eta2 = self.elu(eta2)
+        eta1 = self.fc_out(eta2)
+        eta1 = self.dropout(eta1)
+
+        gate = torch.sigmoid(
+            self.gate_fc(eta1)
+        )
+
+        value = self.value_fc(
+            eta1
+        )
+
+        glu_output = gate * value
+
+        output = self.layer_norm(
+            a + glu_output
+        )
+
+        return output
+
+
+class ConvolutionalAttentionModule(nn.Module):
+    def __init__(
+        self,
+        hidden_dim,
+        kernel_size=3
+    ):
+        super().__init__()
+
+        self.conv = nn.Conv1d(
+            in_channels=hidden_dim,
+            out_channels=hidden_dim,
+            kernel_size=kernel_size,
+            padding=kernel_size // 2
+        )
+
+        self.score = nn.Linear(
+            hidden_dim,
+            1
+        )
+
+        self.sigmoid_gate = nn.Linear(
+            hidden_dim,
+            hidden_dim
+        )
+
+    def forward(self, x):
+        conv_out = self.conv(
+            x.transpose(1, 2)
+        ).transpose(1, 2)
+
+        score = self.score(
+            conv_out
+        )
+
+        alpha = torch.softmax(
+            score,
+            dim=1
+        )
+
+        local_gate = torch.sigmoid(
+            self.sigmoid_gate(
+                conv_out
             )
-        return np.hstack(results)
+        )
+
+        local_enhanced = (
+            x * local_gate
+        )
+
+        seq_len = x.size(1)
+
+        enhanced_sequence = (
+            local_enhanced
+            * alpha
+            * seq_len
+        )
+
+        global_feature = torch.sum(
+            alpha * x,
+            dim=1
+        )
+
+        return (
+            enhanced_sequence,
+            global_feature,
+            alpha
+        )
+
+
+class CrossAttention(nn.Module):
+    def __init__(self, hidden_dim):
+        super().__init__()
+
+        self.hidden_dim = hidden_dim
+
+        self.q_proj = nn.Linear(
+            hidden_dim,
+            hidden_dim
+        )
+
+        self.k_proj = nn.Linear(
+            hidden_dim,
+            hidden_dim
+        )
+
+        self.v_proj = nn.Linear(
+            hidden_dim,
+            hidden_dim
+        )
+
+        self.out_proj = nn.Linear(
+            hidden_dim,
+            hidden_dim
+        )
+
+        self.scale = hidden_dim ** -0.5
+
+    def forward(
+        self,
+        query,
+        key,
+        value
+    ):
+        Q = self.q_proj(query)
+        K = self.k_proj(key)
+        V = self.v_proj(value)
+
+        scores = torch.matmul(
+            Q,
+            K.transpose(-2, -1)
+        )
+
+        scores = scores * self.scale
+
+        attention_weights = torch.softmax(
+            scores,
+            dim=-1
+        )
+
+        attended = torch.matmul(
+            attention_weights,
+            V
+        )
+
+        output = self.out_proj(
+            attended
+        )
+
+        return output, attention_weights
+
+
+class WeightedFusion(nn.Module):
+    def __init__(self, hidden_dim):
+        super().__init__()
+
+        self.gate = nn.Linear(
+            hidden_dim * 2,
+            hidden_dim
+        )
+
+        self.proj = nn.Linear(
+            hidden_dim * 2,
+            hidden_dim
+        )
+
+        self.layer_norm = nn.LayerNorm(
+            hidden_dim
+        )
+
+    def forward(self, feature_a, feature_b):
+        combined = torch.cat(
+            [
+                feature_a,
+                feature_b
+            ],
+            dim=-1
+        )
+
+        gate = torch.sigmoid(
+            self.gate(combined)
+        )
+
+        candidate = torch.tanh(
+            self.proj(combined)
+        )
+
+        fused = (
+            gate * candidate
+            +
+            (1.0 - gate) * feature_b
+        )
+
+        fused = self.layer_norm(fused)
+
+        return fused
+
+
+class MLSTM_ICA(nn.Module):
+    def __init__(
+        self,
+        encoder_dim,
+        decoder_dim,
+        hidden_dim,
+        target_dim,
+        pred_steps=1,
+        num_layers=2,
+        mogrify_steps=3,
+        dropout=0.1
+    ):
+        super().__init__()
+
+        self.hidden_dim = hidden_dim
+        self.target_dim = target_dim
+        self.pred_steps = pred_steps
+
+        self.encoder = MogrifierLSTM(
+            input_dim=encoder_dim,
+            hidden_dim=hidden_dim,
+            num_layers=num_layers,
+            mogrify_steps=mogrify_steps,
+            dropout=dropout
+        )
+
+        self.decoder = MogrifierLSTM(
+            input_dim=decoder_dim,
+            hidden_dim=hidden_dim,
+            num_layers=num_layers,
+            mogrify_steps=mogrify_steps,
+            dropout=dropout
+        )
+
+        self.cam = ConvolutionalAttentionModule(
+            hidden_dim=hidden_dim,
+            kernel_size=3
+        )
+
+        self.grn = GRN(
+            input_dim=hidden_dim,
+            hidden_dim=hidden_dim * 2,
+            dropout=dropout
+        )
+
+        self.cross_attention = CrossAttention(
+            hidden_dim
+        )
+
+        self.fusion = WeightedFusion(
+            hidden_dim
+        )
+
+        self.output_head = nn.Sequential(
+            nn.Linear(
+                hidden_dim,
+                hidden_dim
+            ),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(
+                hidden_dim,
+                target_dim * pred_steps
+            )
+        )
+
+    def forward(
+        self,
+        x_enc,
+        x_dec,
+        return_attention=False
+    ):
+        enc_out, (
+            h_enc,
+            c_enc
+        ) = self.encoder(
+            x_enc
+        )
+
+        dec_out, (
+            h_dec,
+            c_dec
+        ) = self.decoder(
+            x_dec,
+            hidden=(
+                h_enc,
+                c_enc
+            )
+        )
+
+        cam_sequence, \
+        cam_global, \
+        cam_weights = self.cam(
+            enc_out
+        )
+
+        encoder_context = enc_out.mean(
+            dim=1,
+            keepdim=True
+        )
+
+        encoder_context = encoder_context.expand(
+            -1,
+            dec_out.size(1),
+            -1
+        )
+
+        grn_output = self.grn(
+            a=dec_out,
+            c=encoder_context
+        )
+
+        cross_output, \
+        cross_weights = self.cross_attention(
+            query=grn_output,
+            key=cam_sequence,
+            value=cam_sequence
+        )
+
+        fused_sequence = self.fusion(
+            cross_output,
+            grn_output
+        )
+
+        final_feature = fused_sequence[
+            :,
+            -1,
+            :
+        ]
+
+        output = self.output_head(
+            final_feature
+        )
+
+        output = output.view(
+            -1,
+            self.pred_steps,
+            self.target_dim
+        )
+
+        if return_attention:
+            return (
+                output,
+                cam_weights,
+                cross_weights
+            )
+
+        return output
+
+
+class LearnableWeightedHuberLoss(nn.Module):
+    def __init__(
+        self,
+        target_dim,
+        delta=0.1
+    ):
+        super().__init__()
+
+        self.target_dim = target_dim
+        self.delta = delta
+
+        self.weight_logits = nn.Parameter(
+            torch.zeros(target_dim)
+        )
+
+    def forward(
+        self,
+        prediction,
+        target
+    ):
+        error = (
+            prediction - target
+        ).abs()
+
+        quadratic = torch.clamp(
+            error,
+            max=self.delta
+        )
+
+        linear = (
+            error - quadratic
+        )
+
+        huber = (
+            0.5 * quadratic.pow(2)
+            +
+            self.delta * linear
+        )
+
+        weights = torch.softmax(
+            self.weight_logits,
+            dim=0
+        )
+
+        weights = (
+            weights
+            * self.target_dim
+        )
+
+        weighted_huber = (
+            huber
+            * weights.view(
+                1,
+                1,
+                -1
+            )
+        )
+
+        return weighted_huber.mean()
+
+    def get_weights(self):
+        with torch.no_grad():
+            weights = torch.softmax(
+                self.weight_logits,
+                dim=0
+            )
+
+            weights = (
+                weights
+                * self.target_dim
+            )
+
+        return weights.cpu().numpy()
 
 
 class TimeSeriesDataset(Dataset):
-    def __init__(self, X_enc, X_dec, y):
+    def __init__(
+        self,
+        X_enc,
+        X_dec,
+        y
+    ):
         self.X_enc = X_enc
         self.X_dec = X_dec
         self.y = y
@@ -306,261 +686,1113 @@ class TimeSeriesDataset(Dataset):
         return len(self.y)
 
     def __getitem__(self, idx):
-        return self.X_enc[idx], self.X_dec[idx], self.y[idx]
+        return (
+            self.X_enc[idx],
+            self.X_dec[idx],
+            self.y[idx]
+        )
 
 
-# ------------------- Training System -------------------
+class SeparatedInputProcessor:
+    def __init__(
+        self,
+        encoder_features,
+        decoder_features,
+        target_cols,
+        window_size=15,
+        pred_steps=1
+    ):
+        self.encoder_features = encoder_features
+        self.decoder_features = decoder_features
+        self.target_cols = target_cols
+        self.window_size = window_size
+        self.pred_steps = pred_steps
+
+        self.encoder_scaler = MinMaxScaler()
+        self.decoder_scaler = MinMaxScaler()
+
+        self.target_scalers = {
+            col: MinMaxScaler()
+            for col in target_cols
+        }
+
+        self.fitted = False
+
+    def check_data(self, data):
+        required = list(
+            dict.fromkeys(
+                self.encoder_features
+                +
+                self.decoder_features
+                +
+                self.target_cols
+            )
+        )
+
+        missing = [
+            col
+            for col in required
+            if col not in data.columns
+        ]
+
+        if missing:
+            raise ValueError(
+                f"Missing columns: {missing}"
+            )
+
+        values = data[
+            required
+        ].apply(
+            pd.to_numeric,
+            errors="coerce"
+        )
+
+        if values.isnull().any().any():
+            bad_cols = values.columns[
+                values.isnull().any()
+            ].tolist()
+
+            raise ValueError(
+                f"NaN or non-numeric values found in: {bad_cols}"
+            )
+
+        if not np.isfinite(
+            values.values
+        ).all():
+            raise ValueError(
+                "Inf or -Inf values found."
+            )
+
+    def fit_scalers(
+        self,
+        train_data
+    ):
+        enc = train_data[
+            self.encoder_features
+        ].values
+
+        dec = train_data[
+            self.decoder_features
+        ].values
+
+        target = train_data[
+            self.target_cols
+        ].values
+
+        self.encoder_scaler.fit(enc)
+        self.decoder_scaler.fit(dec)
+
+        for i, col in enumerate(
+            self.target_cols
+        ):
+            self.target_scalers[
+                col
+            ].fit(
+                target[:, i].reshape(
+                    -1,
+                    1
+                )
+            )
+
+        self.fitted = True
+
+    def transform_segment(
+        self,
+        raw_data
+    ):
+        if not self.fitted:
+            raise RuntimeError(
+                "Scaler has not been fitted."
+            )
+
+        encoder_data = raw_data[
+            self.encoder_features
+        ].values
+
+        decoder_data = raw_data[
+            self.decoder_features
+        ].values
+
+        target_data = raw_data[
+            self.target_cols
+        ].values
+
+        scaled_encoder = (
+            self.encoder_scaler
+            .transform(
+                encoder_data
+            )
+        )
+
+        scaled_decoder = (
+            self.decoder_scaler
+            .transform(
+                decoder_data
+            )
+        )
+
+        scaled_targets = []
+
+        for i, col in enumerate(
+            self.target_cols
+        ):
+            transformed = (
+                self.target_scalers[
+                    col
+                ].transform(
+                    target_data[
+                        :,
+                        i
+                    ].reshape(
+                        -1,
+                        1
+                    )
+                )
+            )
+
+            scaled_targets.append(
+                transformed
+            )
+
+        scaled_target = np.hstack(
+            scaled_targets
+        )
+
+        return self.make_windows(
+            scaled_encoder,
+            scaled_decoder,
+            scaled_target
+        )
+
+    def make_windows(
+        self,
+        scaled_encoder,
+        scaled_decoder,
+        scaled_target
+    ):
+        X_enc = []
+        X_dec = []
+        y = []
+
+        max_index = (
+            len(scaled_encoder)
+            -
+            self.window_size
+            -
+            self.pred_steps
+            +
+            1
+        )
+
+        if max_index <= 0:
+            raise ValueError(
+                "Insufficient data length."
+            )
+
+        for i in range(max_index):
+            X_enc.append(
+                scaled_encoder[
+                    i:
+                    i + self.window_size
+                ]
+            )
+
+            X_dec.append(
+                scaled_decoder[
+                    i:
+                    i + self.window_size
+                ]
+            )
+
+            y.append(
+                scaled_target[
+                    i + self.window_size:
+                    i + self.window_size + self.pred_steps
+                ]
+            )
+
+        X_enc = torch.tensor(
+            np.array(X_enc),
+            dtype=torch.float32
+        )
+
+        X_dec = torch.tensor(
+            np.array(X_dec),
+            dtype=torch.float32
+        )
+
+        y = torch.tensor(
+            np.array(y),
+            dtype=torch.float32
+        )
+
+        return X_enc, X_dec, y
+
+    def inverse_transform_targets(
+        self,
+        scaled_data
+    ):
+        results = []
+
+        for i, col in enumerate(
+            self.target_cols
+        ):
+            restored = self.target_scalers[
+                col
+            ].inverse_transform(
+                scaled_data[
+                    :,
+                    i
+                ].reshape(
+                    -1,
+                    1
+                )
+            )
+
+            results.append(
+                restored
+            )
+
+        return np.hstack(results)
+
 
 class ForecastingSystem:
-    def __init__(self, model, processor, save_path, lr=1e-3, patience=7):
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.model = model.to(self.device)
+    def __init__(
+        self,
+        model,
+        processor,
+        save_path,
+        lr=1e-3,
+        patience=10,
+        huber_delta=0.1
+    ):
+        self.device = torch.device(
+            "cuda"
+            if torch.cuda.is_available()
+            else "cpu"
+        )
+
+        self.model = model.to(
+            self.device
+        )
+
         self.processor = processor
-        self.optimizer = optim.AdamW(model.parameters(), lr=lr)
 
-        # Fixed to Huber Loss as per MLSTM-ICA config
-        self.criterion = nn.HuberLoss(delta=1.0)
+        self.criterion = LearnableWeightedHuberLoss(
+            target_dim=len(
+                processor.target_cols
+            ),
+            delta=huber_delta
+        ).to(
+            self.device
+        )
 
-        self.best_mape = np.inf
+        parameters = (
+            list(
+                self.model.parameters()
+            )
+            +
+            list(
+                self.criterion.parameters()
+            )
+        )
+
+        self.optimizer = optim.AdamW(
+            parameters,
+            lr=lr,
+            weight_decay=1e-5
+        )
+
+        self.save_path = save_path
+        self.best_val_loss = np.inf
         self.patience = patience
         self.counter = 0
-        self.save_path = save_path
         self.train_loss_history = []
+        self.val_loss_history = []
 
-    def train_epoch(self, train_loader):
+    def train_epoch(
+        self,
+        loader
+    ):
         self.model.train()
+        self.criterion.train()
+
         total_loss = 0.0
-        for x_enc, x_dec, targets in train_loader:
-            x_enc = x_enc.to(self.device)
-            x_dec = x_dec.to(self.device)
-            targets = targets.to(self.device)
+
+        for (
+            x_enc,
+            x_dec,
+            targets
+        ) in loader:
+            x_enc = x_enc.to(
+                self.device
+            )
+
+            x_dec = x_dec.to(
+                self.device
+            )
+
+            targets = targets.to(
+                self.device
+            )
+
             self.optimizer.zero_grad()
-            outputs = self.model(x_enc, x_dec)
-            loss = self.criterion(outputs, targets)
+
+            outputs = self.model(
+                x_enc,
+                x_dec
+            )
+
+            loss = self.criterion(
+                outputs,
+                targets
+            )
+
             loss.backward()
-            nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             self.optimizer.step()
+
             total_loss += loss.item()
 
-        avg_loss = total_loss / len(train_loader)
-        self.train_loss_history.append(avg_loss)
+        avg_loss = (
+            total_loss
+            /
+            len(loader)
+        )
+
+        self.train_loss_history.append(
+            avg_loss
+        )
+
         return avg_loss
 
-    def evaluate(self, loader, return_predictions=False):
+    def validation_loss(
+        self,
+        loader
+    ):
         self.model.eval()
-        y_true, y_pred = [], []
+        self.criterion.eval()
+
+        total_loss = 0.0
+
         with torch.no_grad():
-            for x_enc, x_dec, targets in loader:
-                x_enc = x_enc.to(self.device)
-                x_dec = x_dec.to(self.device)
-                preds = self.model(x_enc, x_dec)
-                y_true.append(targets.cpu().numpy())
-                y_pred.append(preds.cpu().numpy())
-        y_true = np.concatenate(y_true, axis=0)
-        y_pred = np.concatenate(y_pred, axis=0)
-        y_true_unscaled = self.processor.inverse_transform_targets(y_true[:, 0, :])
-        y_pred_unscaled = self.processor.inverse_transform_targets(y_pred[:, 0, :])
+            for (
+                x_enc,
+                x_dec,
+                targets
+            ) in loader:
+                x_enc = x_enc.to(
+                    self.device
+                )
+
+                x_dec = x_dec.to(
+                    self.device
+                )
+
+                targets = targets.to(
+                    self.device
+                )
+
+                outputs = self.model(
+                    x_enc,
+                    x_dec
+                )
+
+                loss = self.criterion(
+                    outputs,
+                    targets
+                )
+
+                total_loss += loss.item()
+
+        avg_loss = (
+            total_loss
+            /
+            len(loader)
+        )
+
+        self.val_loss_history.append(
+            avg_loss
+        )
+
+        return avg_loss
+
+    def evaluate(
+        self,
+        loader,
+        return_predictions=False
+    ):
+        self.model.eval()
+
+        true_list = []
+        pred_list = []
+
+        with torch.no_grad():
+            for (
+                x_enc,
+                x_dec,
+                targets
+            ) in loader:
+                x_enc = x_enc.to(
+                    self.device
+                )
+
+                x_dec = x_dec.to(
+                    self.device
+                )
+
+                preds = self.model(
+                    x_enc,
+                    x_dec
+                )
+
+                true_list.append(
+                    targets.numpy()
+                )
+
+                pred_list.append(
+                    preds.cpu().numpy()
+                )
+
+        y_true = np.concatenate(
+            true_list,
+            axis=0
+        )
+
+        y_pred = np.concatenate(
+            pred_list,
+            axis=0
+        )
+
+        if y_true.shape[1] != 1:
+            raise ValueError(
+                "Current evaluation supports pred_steps=1."
+            )
+
+        y_true = (
+            y_true[:, 0, :]
+        )
+
+        y_pred = (
+            y_pred[:, 0, :]
+        )
+
+        y_true_unscaled = (
+            self.processor
+            .inverse_transform_targets(
+                y_true
+            )
+        )
+
+        y_pred_unscaled = (
+            self.processor
+            .inverse_transform_targets(
+                y_pred
+            )
+        )
+
         metrics = {}
-        for i, col in enumerate(self.processor.target_cols):
-            r2 = r2_score(y_true_unscaled[:, i], y_pred_unscaled[:, i])
-            mape = np.mean(np.abs((y_true_unscaled[:, i] - y_pred_unscaled[:, i]) /
-                                  (y_true_unscaled[:, i] + 1e-8))) * 100
-            mae = mean_absolute_error(y_true_unscaled[:, i], y_pred_unscaled[:, i])
-            rmse = np.sqrt(mean_squared_error(y_true_unscaled[:, i], y_pred_unscaled[:, i]))
-            metrics[col] = {'MAE': mae, 'RMSE': rmse, 'R2': r2, 'MAPE(%)': mape}
+
+        for i, col in enumerate(
+            self.processor.target_cols
+        ):
+            true_col = (
+                y_true_unscaled[
+                    :,
+                    i
+                ]
+            )
+
+            pred_col = (
+                y_pred_unscaled[
+                    :,
+                    i
+                ]
+            )
+
+            r2 = r2_score(
+                true_col,
+                pred_col
+            )
+
+            mae = mean_absolute_error(
+                true_col,
+                pred_col
+            )
+
+            rmse = np.sqrt(
+                mean_squared_error(
+                    true_col,
+                    pred_col
+                )
+            )
+
+            eps = 1e-8
+
+            mape = np.mean(
+                np.abs(
+                    true_col - pred_col
+                )
+                /
+                np.maximum(
+                    np.abs(true_col),
+                    eps
+                )
+            ) * 100
+
+            metrics[col] = {
+                "R2": r2,
+                "MAE": mae,
+                "RMSE": rmse,
+                "MAPE(%)": mape
+            }
+
         if return_predictions:
-            return metrics, y_true_unscaled, y_pred_unscaled
+            return (
+                metrics,
+                y_true_unscaled,
+                y_pred_unscaled
+            )
+
         return metrics
 
-    def early_stopping(self, val_metrics):
-        current_mape = np.mean([m['MAPE(%)'] for m in val_metrics.values()])
-        if current_mape < self.best_mape:
-            print(
-                f"    >> Better model found (MAPE: {self.best_mape:.2f}% -> {current_mape:.2f}%), saving to {self.save_path}")
-            self.best_mape = current_mape
+    def early_stopping(
+        self,
+        val_loss
+    ):
+        if val_loss < self.best_val_loss:
+            self.best_val_loss = val_loss
             self.counter = 0
-            torch.save(self.model.state_dict(), self.save_path)
+
+            torch.save(
+                {
+                    "model_state_dict":
+                        self.model.state_dict(),
+
+                    "loss_state_dict":
+                        self.criterion.state_dict()
+                },
+                self.save_path
+            )
+
             return False
+
+        self.counter += 1
+
+        return (
+            self.counter
+            >=
+            self.patience
+        )
+
+    def load_best_model(
+        self
+    ):
+        checkpoint = torch.load(
+            self.save_path,
+            map_location=self.device
+        )
+
+        self.model.load_state_dict(
+            checkpoint[
+                "model_state_dict"
+            ]
+        )
+
+        self.criterion.load_state_dict(
+            checkpoint[
+                "loss_state_dict"
+            ]
+        )
+
+
+def plot_predictions(
+    true_values,
+    pred_values,
+    target_names,
+    model_name="MLSTM-ICA"
+):
+    mpl.rcParams.update(
+        {
+            "font.family":
+                "Times New Roman",
+
+            "axes.titlesize":
+                16,
+
+            "axes.labelsize":
+                16,
+
+            "xtick.labelsize":
+                16,
+
+            "ytick.labelsize":
+                16,
+
+            "legend.fontsize":
+                14,
+
+            "font.size":
+                16,
+
+            "mathtext.default":
+                "regular"
+        }
+    )
+
+    for i, col in enumerate(
+        target_names
+    ):
+        plt.figure(
+            figsize=(10, 6),
+            dpi=300
+        )
+
+        true_col = (
+            true_values[
+                :,
+                i
+            ]
+        )
+
+        pred_col = (
+            pred_values[
+                :,
+                i
+            ]
+        )
+
+        plt.plot(
+            true_col,
+            label="Actual",
+            linewidth=1.2,
+            alpha=0.85
+        )
+
+        plt.plot(
+            pred_col,
+            label="Predicted",
+            linewidth=1.2
+        )
+
+        plt.xlabel(
+            "Sample NO."
+        )
+
+        if col in [
+            "Tor",
+            "Tor1"
+        ]:
+            ylabel = (
+                "Torque (kN·m)"
+            )
+
+        elif col in [
+            "Th",
+            "Th1"
+        ]:
+            ylabel = (
+                "Thrust (kN)"
+            )
+
         else:
-            self.counter += 1
-            if self.counter >= self.patience:
-                return True
-        return False
+            ylabel = col
 
+        plt.ylabel(
+            ylabel
+        )
 
-# ------------------- Plotting -------------------
+        plt.title(
+            f"Prediction with {model_name}"
+        )
 
-def plot_predictions(true_values, pred_values, target_names=None, title_text=""):
-    mpl.rcParams.update({
-        'font.family': 'Times New Roman',
-        'axes.titlesize': 16,
-        'axes.labelsize': 16,
-        'xtick.labelsize': 18,
-        'ytick.labelsize': 18,
-        'legend.fontsize': 16,
-        'font.size': 18,
-        'mathtext.default': 'regular'
-    })
+        y_min = min(
+            true_col.min(),
+            pred_col.min()
+        )
 
-    if target_names is None:
-        target_names = [f"Target_{i}" for i in range(true_values.shape[1])]
+        y_max = max(
+            true_col.max(),
+            pred_col.max()
+        )
 
-    for i, col in enumerate(target_names):
-        plt.figure(figsize=(10, 6), dpi=600)
+        y_range = (
+            y_max - y_min
+        )
 
-        y_min_data = min(true_values[:, i].min(), pred_values[:, i].min())
-        y_max_data = max(true_values[:, i].max(), pred_values[:, i].max())
-        y_range = y_max_data - y_min_data
+        if y_range == 0:
+            y_range = 1.0
 
-        plt.plot(true_values[:, i], label='Actual', linewidth=1.5, alpha=0.8)
-        plt.plot(pred_values[:, i], label='Predicted', linewidth=1.5)
+        margin = (
+            0.05 * y_range
+        )
 
-        plt.xlabel('Sample NO.', fontsize=20)
+        plt.ylim(
+            y_min - margin,
+            y_max + margin
+        )
 
-        if col == 'Tor1' or col == 'Tor':
-            tick_interval = 500
-            ylabel_text = 'Torque (kN·m)'
+        plt.legend(
+            loc="upper right",
+            frameon=False
+        )
 
-            target_max_y = 2500
-
-            y_ticks_start = np.floor(y_min_data / tick_interval) * tick_interval
-
-            y_ticks = np.arange(y_ticks_start, target_max_y + 1, tick_interval)
-
-            plt.ylim(y_min_data - 0.05 * y_range, target_max_y)
-            plt.yticks(y_ticks)
-
-        elif col == 'Th1' or col == 'Th':
-            tick_interval = 2500
-            ylabel_text = 'Thrust (kN)'
-
-            target_min_y = 2500
-
-            y_max_adj = y_max_data + tick_interval
-
-            y_ticks = np.arange(target_min_y, y_max_adj + tick_interval, tick_interval)
-
-            plt.ylim(target_min_y, y_max_adj)
-            plt.yticks(y_ticks)
-
-        else:
-            tick_interval = (y_range / 5) if y_range != 0 else 1
-            ylabel_text = col
-
-            y_max_adj = y_max_data + tick_interval
-            y_ticks_start = np.floor(y_min_data / tick_interval) * tick_interval
-            y_ticks_end = y_max_adj + tick_interval
-            y_ticks = np.arange(y_ticks_start, y_ticks_end, tick_interval)
-
-            plt.ylim(y_min_data - 0.05 * y_range, y_max_adj)
-            plt.yticks(y_ticks)
-
-        plt.ylabel(ylabel_text, fontsize=20)
-
-        plt.title(f'Prediction with MLSTM-ICA', fontsize=22, pad=10)
-
-        plt.legend(loc='upper right', bbox_to_anchor=(1.0, 1.0), frameon=False, fontsize=14)
-
-        plt.gca().spines['top'].set_visible(True)
-        plt.gca().spines['right'].set_visible(True)
         plt.tight_layout()
 
-        safe_suffix = title_text.replace(' ', '_').replace('(', '').replace(')', '').replace('/', '')
-        file_name = f"Prediction_{safe_suffix}_{col}.png"
-        plt.savefig(file_name, bbox_inches='tight', dpi=600)
-        print(f"    -> Plot saved to {file_name}")
+        filename = (
+            f"Prediction_"
+            f"{model_name}_"
+            f"{col}.png"
+        )
+
+        plt.savefig(
+            filename,
+            bbox_inches="tight",
+            dpi=600
+        )
+
         plt.close()
 
+        print(
+            f"Plot saved: {filename}"
+        )
 
-# ------------------- Main Execution -------------------
+
+def plot_loss_curve(
+    train_loss,
+    val_loss
+):
+    plt.figure(
+        figsize=(8, 5),
+        dpi=300
+    )
+
+    plt.plot(
+        train_loss,
+        label="Training Loss"
+    )
+
+    plt.plot(
+        val_loss,
+        label="Validation Loss"
+    )
+
+    plt.xlabel(
+        "Epoch"
+    )
+
+    plt.ylabel(
+        "Weighted Huber Loss"
+    )
+
+    plt.legend(
+        frameon=False
+    )
+
+    plt.tight_layout()
+
+    plt.savefig(
+        "MLSTM_ICA_Loss.png",
+        dpi=600
+    )
+
+    plt.close()
+
 
 if __name__ == "__main__":
 
     config = {
-        'hidden_dim': 64,
-        'num_layers': 1,
-        'batch_size': 32,
-        'mogrify_steps': 4,
-        'num_heads': 2,
-        'lr': 0.001,
-        'patience': 50,
-        'max_epochs': 50
+        "hidden_dim": 128,
+        "num_layers": 2,
+        "batch_size": 32,
+        "mogrify_steps": 3,
+        "window_size": 15,
+        "pred_steps": 1,
+        "dropout": 0.1,
+        "learning_rate": 0.001,
+        "huber_delta": 0.1,
+        "max_epochs": 50,
+        "patience": 10
     }
 
-    # Data Path
-    csv_path = 'your data.csv'
+    csv_path = "your data.csv"
 
-    if not os.path.exists(csv_path):
-        print(f"Error: File not found at {csv_path}")
-    else:
-        print(f"Loading data from {csv_path}...")
-        processor = SafeSeparatedInputProcessor(
-            encoder_features=['Tor1', 'Th1'],
-            decoder_features=['PR', 'F', 'RPM'],
-            target_cols=['Tor1', 'Th1'],
-            window_size=15,
-            pred_steps=1
-        )
-        X_enc, X_dec, y = processor.load_data(csv_path, fit_scalers=True)
+    model_name = "MLSTM-ICA"
 
-        split_idx = int(0.8 * len(X_enc))
-        train_set = TimeSeriesDataset(X_enc[:split_idx], X_dec[:split_idx], y[:split_idx])
-        val_set = TimeSeriesDataset(X_enc[split_idx:], X_dec[split_idx:], y[split_idx:])
+    save_path = (
+        "best_model_MLSTM_ICA.pth"
+    )
 
-        train_loader = DataLoader(train_set, batch_size=config['batch_size'], shuffle=True)
-        val_loader = DataLoader(val_set, batch_size=config['batch_size'], shuffle=False)
-
-        # Initialize MLSTM-ICA Model
-        print(f"\n{'=' * 20} Initializing MLSTM-ICA {'=' * 20}")
-        model_name = "MLSTM-ICA"
-        save_path = f"best_model_{model_name}.pth"
-
-        # Instantiate specific MLSTM-ICA Class
-        model = MLSTM_ICA(
-            encoder_dim=len(processor.encoder_features),
-            decoder_dim=len(processor.decoder_features),
-            hidden_dim=config['hidden_dim'],
-            target_dim=len(processor.target_cols),
-            pred_steps=1,
-            num_layers=config['num_layers'],
-            mogrify_steps=config['mogrify_steps'],
-            num_heads=config['num_heads']
+    if not os.path.exists(
+        csv_path
+    ):
+        raise FileNotFoundError(
+            f"File not found: {csv_path}"
         )
 
-        system = ForecastingSystem(
-            model, processor,
-            save_path=save_path,
-            lr=config['lr'],
-            patience=config['patience']
+    raw_data = pd.read_csv(
+        csv_path
+    )
+
+    processor = SeparatedInputProcessor(
+        encoder_features=[
+            "Tor1",
+            "Th1"
+        ],
+        decoder_features=[
+            "F",
+            "PR",
+            "RPM"
+        ],
+        target_cols=[
+            "Tor1",
+            "Th1"
+        ],
+        window_size=
+            config["window_size"],
+        pred_steps=
+            config["pred_steps"]
+    )
+
+    processor.check_data(
+        raw_data
+    )
+
+    total_len = len(
+        raw_data
+    )
+
+    train_pool_end = int(
+        total_len * 0.80
+    )
+
+    train_pool = raw_data.iloc[
+        :train_pool_end
+    ].reset_index(
+        drop=True
+    )
+
+    test_data = raw_data.iloc[
+        train_pool_end:
+    ].reset_index(
+        drop=True
+    )
+
+    train_end = int(
+        len(train_pool)
+        * 0.90
+    )
+
+    train_data = train_pool.iloc[
+        :train_end
+    ].reset_index(
+        drop=True
+    )
+
+    val_data = train_pool.iloc[
+        train_end:
+    ].reset_index(
+        drop=True
+    )
+
+    processor.fit_scalers(
+        train_data
+    )
+
+    X_enc_train, \
+    X_dec_train, \
+    y_train = processor.transform_segment(
+        train_data
+    )
+
+    X_enc_val, \
+    X_dec_val, \
+    y_val = processor.transform_segment(
+        val_data
+    )
+
+    X_enc_test, \
+    X_dec_test, \
+    y_test = processor.transform_segment(
+        test_data
+    )
+
+    train_dataset = TimeSeriesDataset(
+        X_enc_train,
+        X_dec_train,
+        y_train
+    )
+
+    val_dataset = TimeSeriesDataset(
+        X_enc_val,
+        X_dec_val,
+        y_val
+    )
+
+    test_dataset = TimeSeriesDataset(
+        X_enc_test,
+        X_dec_test,
+        y_test
+    )
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=
+            config["batch_size"],
+        shuffle=True
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=
+            config["batch_size"],
+        shuffle=False
+    )
+
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=
+            config["batch_size"],
+        shuffle=False
+    )
+
+    model = MLSTM_ICA(
+        encoder_dim=len(
+            processor.encoder_features
+        ),
+        decoder_dim=len(
+            processor.decoder_features
+        ),
+        hidden_dim=
+            config["hidden_dim"],
+        target_dim=len(
+            processor.target_cols
+        ),
+        pred_steps=
+            config["pred_steps"],
+        num_layers=
+            config["num_layers"],
+        mogrify_steps=
+            config["mogrify_steps"],
+        dropout=
+            config["dropout"]
+    )
+
+    system = ForecastingSystem(
+        model=model,
+        processor=processor,
+        save_path=save_path,
+        lr=
+            config["learning_rate"],
+        patience=
+            config["patience"],
+        huber_delta=
+            config["huber_delta"]
+    )
+
+    print(
+        f"Device: {system.device}"
+    )
+
+    if not ONLY_PLOT:
+
+        for epoch in range(
+            config["max_epochs"]
+        ):
+            train_loss = (
+                system.train_epoch(
+                    train_loader
+                )
+            )
+
+            val_loss = (
+                system.validation_loss(
+                    val_loader
+                )
+            )
+
+            weights = (
+                system.criterion
+                .get_weights()
+            )
+
+            print(
+                f"Epoch "
+                f"{epoch + 1:03d}/"
+                f"{config['max_epochs']} "
+                f"| Train Loss="
+                f"{train_loss:.6f} "
+                f"| Val Loss="
+                f"{val_loss:.6f} "
+                f"| Weights="
+                f"{weights}"
+            )
+
+            if system.early_stopping(
+                val_loss
+            ):
+                print(
+                    f"Early stopping at "
+                    f"epoch {epoch + 1}"
+                )
+                break
+
+        plot_loss_curve(
+            system.train_loss_history,
+            system.val_loss_history
         )
 
-        if not ONLY_PLOT:
-            print("Starting Training...")
-            #  - Skipped: No external query needed for internal architecture
-            for epoch in range(config['max_epochs']):
-                train_loss = system.train_epoch(train_loader)
-                val_metrics = system.evaluate(val_loader)
-                mape_avg = np.mean([m['MAPE(%)'] for m in val_metrics.values()])
+    if not os.path.exists(
+        save_path
+    ):
+        raise FileNotFoundError(
+            f"Model not found: {save_path}"
+        )
 
-                if (epoch + 1) % 5 == 0:
-                    print(f"  Epoch {epoch + 1}: Train Loss (Huber)={train_loss:.4f}, Val Avg MAPE={mape_avg:.2f}%")
+    system.load_best_model()
 
-                if system.early_stopping(val_metrics):
-                    print(f"  Early stopping at epoch {epoch + 1}")
-                    break
-        else:
-            print("  [Mode: ONLY_PLOT] Skipping training...")
+    final_metrics, \
+    y_true, \
+    y_pred = system.evaluate(
+        test_loader,
+        return_predictions=True
+    )
 
-        # Final Evaluation
-        if os.path.exists(save_path):
-            print(f"  Loading model from: {save_path}")
-            model.load_state_dict(torch.load(save_path))
+    plot_predictions(
+        true_values=y_true,
+        pred_values=y_pred,
+        target_names=
+            processor.target_cols,
+        model_name=model_name
+    )
 
-            final_metrics, y_true, y_pred = system.evaluate(val_loader, return_predictions=True)
-            plot_predictions(y_true, y_pred, processor.target_cols, title_text=model_name)
+    print(
+        "\nFinal Test Results"
+    )
 
-            print(f"\n{'=' * 20} Final Results ({model_name}) {'=' * 20}")
-            for col, res in final_metrics.items():
-                print(f"{col}: R2={res['R2']:.4f}, MAE={res['MAE']:.4f}, MAPE={res['MAPE(%)']:.2f}%")
-        else:
-            print(f"  Error: Model file {save_path} not found.")
+    for col, result in (
+        final_metrics.items()
+    ):
+        print(
+            f"{col}: "
+            f"R2={result['R2']:.4f}, "
+            f"MAE={result['MAE']:.4f}, "
+            f"RMSE={result['RMSE']:.4f}, "
+            f"MAPE={result['MAPE(%)']:.2f}%"
+        )
+
+    print(
+        "Weighted Huber weights:"
+    )
+
+    learned_weights = (
+        system.criterion
+        .get_weights()
+    )
+
+    for col, weight in zip(
+        processor.target_cols,
+        learned_weights
+    ):
+        print(
+            f"{col}: {weight:.4f}"
+        )
